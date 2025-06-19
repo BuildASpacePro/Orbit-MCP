@@ -1,5 +1,9 @@
+# Core orbital mechanics dependencies
 skyfield>=1.46
 numpy>=1.21.0
+
+# MCP server dependencies  
+mcp>=1.0.0
+
+# Utility dependencies
 python-dateutil>=2.8.2
-typing-extensions>=4.0.0
-pydantic>=1.10.0
