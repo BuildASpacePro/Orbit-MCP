@@ -8,3 +8,4 @@ We do not need the calculate_access_events function, so please remove (no Influx
 
 # Task Three
 It should be possible that if the user provides the MCP server with a list of target locations and a list of satellites, that it can loop through all of them, computing access windows between each satellite and each ground station. 
+

@@ -13,6 +13,9 @@ from skyfield.units import Angle
 from skyfield.almanac import find_discrete, risings_and_settings
 from skyfield.searchlib import find_minima
 
+from .world_cities import lookup_city, search_cities
+from .orbital_elements_to_tle import TLEGenerator, ORBIT_TYPES
+
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ class SatelliteCalculator:
         self.eph = load('de421.bsp')  # Load planetary ephemeris
         self.sun = self.eph['sun']
         self.earth = self.eph['earth']
+        self.tle_generator = TLEGenerator()
     
     def validate_tle(self, line1: str, line2: str) -> TLEValidationResult:
         """Validate Two-Line Element data and extract orbital parameters."""
@@ -647,4 +651,236 @@ class SatelliteCalculator:
         
         logger.info(f"Bulk calculation completed: {total_windows} total access windows found")
         return results
+    
+    def calculate_access_windows_by_city(
+        self,
+        city_name: str,
+        tle_line1: str,
+        tle_line2: str,
+        start_time: datetime,
+        end_time: datetime,
+        elevation_threshold: float = 10.0,
+        time_step_seconds: int = 30
+    ) -> Dict[str, Any]:
+        """Calculate satellite access windows for a city by name lookup."""
+        
+        # Look up city coordinates
+        city_info = lookup_city(city_name)
+        if not city_info:
+            # Try searching for partial matches
+            search_results = search_cities(city_name, limit=5)
+            if search_results:
+                suggested_cities = [city["name"] for city in search_results]
+                raise ValueError(f"City '{city_name}' not found. Did you mean one of: {', '.join(suggested_cities)}?")
+            else:
+                raise ValueError(f"City '{city_name}' not found in database")
+        
+        # Calculate access windows using city coordinates
+        access_windows = self.calculate_access_windows(
+            latitude=city_info["latitude"],
+            longitude=city_info["longitude"],
+            tle_line1=tle_line1,
+            tle_line2=tle_line2,
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold,
+            time_step_seconds=time_step_seconds
+        )
+        
+        # Format response with city information
+        windows_data = []
+        total_duration = 0.0
+        max_elevation = 0.0
+        
+        for window in access_windows:
+            window_dict = {
+                "aos_time": window.aos_time.isoformat(),
+                "los_time": window.los_time.isoformat(),
+                "culmination_time": window.culmination_time.isoformat(),
+                "duration_seconds": window.duration_seconds,
+                "duration_minutes": round(window.duration_seconds / 60.0, 2),
+                "max_elevation_deg": round(window.max_elevation_deg, 2),
+                "aos_azimuth_deg": round(window.aos_azimuth_deg, 2),
+                "los_azimuth_deg": round(window.los_azimuth_deg, 2),
+                "culmination_azimuth_deg": round(window.culmination_azimuth_deg, 2),
+                "ground_lighting": window.ground_lighting,
+                "satellite_lighting": window.satellite_lighting
+            }
+            windows_data.append(window_dict)
+            total_duration += window.duration_seconds
+            max_elevation = max(max_elevation, window.max_elevation_deg)
+        
+        response = {
+            "city_info": {
+                "name": city_info["name"],
+                "country": city_info["country"],
+                "latitude": city_info["latitude"],
+                "longitude": city_info["longitude"],
+                "altitude": city_info["altitude"],
+                "type": city_info["type"]
+            },
+            "summary": {
+                "total_windows": len(access_windows),
+                "total_duration_seconds": total_duration,
+                "total_duration_minutes": round(total_duration / 60.0, 2),
+                "max_elevation_deg": round(max_elevation, 2),
+                "calculation_parameters": {
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                    "elevation_threshold": elevation_threshold,
+                    "time_step_seconds": time_step_seconds
+                }
+            },
+            "access_windows": windows_data
+        }
+        
+        logger.info(f"Found {len(access_windows)} access windows for {city_info['name']}, {city_info['country']}")
+        return response
+    
+    def search_cities_by_name(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search for cities by name or country."""
+        return search_cities(query, limit)
+    
+    def parse_orbital_elements_from_text(self, text: str) -> Dict[str, Any]:
+        """Parse natural language text to extract orbital parameters and generate TLE."""
+        return self.tle_generator.parse_and_generate_tle(text)
+    
+    def calculate_access_windows_from_orbital_elements(
+        self,
+        orbital_text: str,
+        latitude: float,
+        longitude: float,
+        start_time: datetime,
+        end_time: datetime,
+        elevation_threshold: float = 10.0,
+        time_step_seconds: int = 30
+    ) -> Dict[str, Any]:
+        """Calculate access windows using orbital elements from natural language text."""
+        
+        # Parse the orbital elements and generate TLE
+        orbital_result = self.parse_orbital_elements_from_text(orbital_text)
+        
+        # Extract TLE lines
+        tle_line1 = orbital_result['tle']['line1']
+        tle_line2 = orbital_result['tle']['line2']
+        
+        # Calculate access windows using the generated TLE
+        access_windows = self.calculate_access_windows(
+            latitude=latitude,
+            longitude=longitude,
+            tle_line1=tle_line1,
+            tle_line2=tle_line2,
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold,
+            time_step_seconds=time_step_seconds
+        )
+        
+        # Format response with orbital elements information
+        windows_data = []
+        total_duration = 0.0
+        max_elevation = 0.0
+        
+        for window in access_windows:
+            window_dict = {
+                "aos_time": window.aos_time.isoformat(),
+                "los_time": window.los_time.isoformat(),
+                "culmination_time": window.culmination_time.isoformat(),
+                "duration_seconds": window.duration_seconds,
+                "duration_minutes": round(window.duration_seconds / 60.0, 2),
+                "max_elevation_deg": round(window.max_elevation_deg, 2),
+                "aos_azimuth_deg": round(window.aos_azimuth_deg, 2),
+                "los_azimuth_deg": round(window.los_azimuth_deg, 2),
+                "culmination_azimuth_deg": round(window.culmination_azimuth_deg, 2),
+                "ground_lighting": window.ground_lighting,
+                "satellite_lighting": window.satellite_lighting
+            }
+            windows_data.append(window_dict)
+            total_duration += window.duration_seconds
+            max_elevation = max(max_elevation, window.max_elevation_deg)
+        
+        response = {
+            "orbital_request": {
+                "parsed_text": orbital_result['parsed_text'],
+                "parsed_parameters": orbital_result['parsed_parameters'],
+                "generated_tle": orbital_result['tle'],
+                "orbital_summary": orbital_result['summary']
+            },
+            "ground_location": {
+                "latitude": latitude,
+                "longitude": longitude
+            },
+            "summary": {
+                "total_windows": len(access_windows),
+                "total_duration_seconds": total_duration,
+                "total_duration_minutes": round(total_duration / 60.0, 2),
+                "max_elevation_deg": round(max_elevation, 2),
+                "calculation_parameters": {
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                    "elevation_threshold": elevation_threshold,
+                    "time_step_seconds": time_step_seconds
+                }
+            },
+            "access_windows": windows_data
+        }
+        
+        logger.info(f"Found {len(access_windows)} access windows for orbital elements: {orbital_result['summary']}")
+        return response
+    
+    def calculate_access_windows_from_orbital_elements_by_city(
+        self,
+        orbital_text: str,
+        city_name: str,
+        start_time: datetime,
+        end_time: datetime,
+        elevation_threshold: float = 10.0,
+        time_step_seconds: int = 30
+    ) -> Dict[str, Any]:
+        """Calculate access windows using orbital elements and city lookup."""
+        
+        # Look up city coordinates
+        city_info = lookup_city(city_name)
+        if not city_info:
+            # Try searching for partial matches
+            search_results = search_cities(city_name, limit=5)
+            if search_results:
+                suggested_cities = [city["name"] for city in search_results]
+                raise ValueError(f"City '{city_name}' not found. Did you mean one of: {', '.join(suggested_cities)}?")
+            else:
+                raise ValueError(f"City '{city_name}' not found in database")
+        
+        # Calculate access windows using orbital elements
+        result = self.calculate_access_windows_from_orbital_elements(
+            orbital_text=orbital_text,
+            latitude=city_info["latitude"],
+            longitude=city_info["longitude"],
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold,
+            time_step_seconds=time_step_seconds
+        )
+        
+        # Add city information to the response
+        result["city_info"] = {
+            "name": city_info["name"],
+            "country": city_info["country"],
+            "latitude": city_info["latitude"],
+            "longitude": city_info["longitude"],
+            "altitude": city_info["altitude"],
+            "type": city_info["type"]
+        }
+        
+        # Update ground location to use city info
+        result["ground_location"] = result["city_info"]
+        
+        logger.info(f"Found {len(result['access_windows'])} access windows for orbital elements over {city_info['name']}, {city_info['country']}")
+        return result
+    
+    def get_orbit_types(self) -> Dict[str, Any]:
+        """Get available orbit types and their definitions."""
+        return {
+            "orbit_types": ORBIT_TYPES,
+            "description": "Available orbit types for TLE generation from orbital elements"
+        }
     
