@@ -23,7 +23,7 @@ from mcp.types import (
 )
 from mcp.server.stdio import stdio_server
 
-from .satellite_calc import SatelliteCalculator, AccessWindow, AccessEvent, TLEValidationResult
+from .satellite_calc import SatelliteCalculator, AccessWindow, TLEValidationResult
 
 
 # Configure logging
@@ -114,82 +114,6 @@ class SatelliteMCPServer:
                     }
                 ),
                 Tool(
-                    name="calculate_access_events",
-                    description="Calculate detailed satellite access events for InfluxDB-compatible output",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "latitude": {
-                                "type": "number",
-                                "minimum": -90,
-                                "maximum": 90,
-                                "description": "Ground station latitude in decimal degrees (WGS84)"
-                            },
-                            "longitude": {
-                                "type": "number",
-                                "minimum": -180,
-                                "maximum": 180,
-                                "description": "Ground station longitude in decimal degrees (WGS84)"
-                            },
-                            "tle_line1": {
-                                "type": "string",
-                                "pattern": "^1 ",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 1 in standard NORAD format"
-                            },
-                            "tle_line2": {
-                                "type": "string",
-                                "pattern": "^2 ",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 2 in standard NORAD format"
-                            },
-                            "start_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "Start time in ISO 8601 format (UTC)"
-                            },
-                            "end_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "End time in ISO 8601 format (UTC)"
-                            },
-                            "satellite_id": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Unique identifier for the satellite"
-                            },
-                            "location_id": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Unique identifier for the ground station"
-                            },
-                            "location_type": {
-                                "type": "string",
-                                "default": "ground_station",
-                                "description": "Type of location (e.g., ground_station, mobile_unit)"
-                            },
-                            "elevation_threshold": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 90,
-                                "default": 10.0,
-                                "description": "Minimum elevation angle in degrees"
-                            },
-                            "time_step_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 300,
-                                "default": 30,
-                                "description": "Time step for calculations in seconds"
-                            }
-                        },
-                        "required": ["latitude", "longitude", "tle_line1", "tle_line2", 
-                                   "start_time", "end_time", "satellite_id", "location_id"]
-                    }
-                ),
-                Tool(
                     name="validate_tle",
                     description="Validate Two-Line Element data and extract orbital parameters",
                     inputSchema={
@@ -210,6 +134,48 @@ class SatelliteMCPServer:
                         },
                         "required": ["tle_line1", "tle_line2"]
                     }
+                ),
+                Tool(
+                    name="calculate_bulk_access_windows",
+                    description="Calculate access windows for multiple satellites and ground locations from CSV data",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "locations_csv": {
+                                "type": "string",
+                                "description": "CSV content with ground locations (columns: name, latitude, longitude, altitude). Supports flexible column naming."
+                            },
+                            "satellites_csv": {
+                                "type": "string", 
+                                "description": "CSV content with satellite TLE data (columns: name, tle_line1, tle_line2). Supports flexible column naming."
+                            },
+                            "start_time": {
+                                "type": "string",
+                                "format": "date-time",
+                                "description": "Start time in ISO 8601 format (UTC)"
+                            },
+                            "end_time": {
+                                "type": "string",
+                                "format": "date-time",
+                                "description": "End time in ISO 8601 format (UTC)"
+                            },
+                            "elevation_threshold": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 90,
+                                "default": 10.0,
+                                "description": "Minimum elevation angle in degrees"
+                            },
+                            "time_step_seconds": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 300,
+                                "default": 30,
+                                "description": "Time step for calculations in seconds"
+                            }
+                        },
+                        "required": ["locations_csv", "satellites_csv", "start_time", "end_time"]
+                    }
                 )
             ]
             
@@ -221,10 +187,10 @@ class SatelliteMCPServer:
             try:
                 if request.params.name == "calculate_access_windows":
                     return await self._handle_calculate_access_windows(request.params.arguments)
-                elif request.params.name == "calculate_access_events":
-                    return await self._handle_calculate_access_events(request.params.arguments)
                 elif request.params.name == "validate_tle":
                     return await self._handle_validate_tle(request.params.arguments)
+                elif request.params.name == "calculate_bulk_access_windows":
+                    return await self._handle_calculate_bulk_access_windows(request.params.arguments)
                 else:
                     raise ValueError(f"Unknown tool: {request.params.name}")
                     
@@ -275,7 +241,9 @@ class SatelliteMCPServer:
                     "max_elevation_deg": round(window.max_elevation_deg, 2),
                     "aos_azimuth_deg": round(window.aos_azimuth_deg, 2),
                     "los_azimuth_deg": round(window.los_azimuth_deg, 2),
-                    "culmination_azimuth_deg": round(window.culmination_azimuth_deg, 2)
+                    "culmination_azimuth_deg": round(window.culmination_azimuth_deg, 2),
+                    "ground_lighting": window.ground_lighting,
+                    "satellite_lighting": window.satellite_lighting
                 }
                 windows_data.append(window_dict)
                 total_duration += window.duration_seconds
@@ -305,84 +273,6 @@ class SatelliteMCPServer:
             
         except Exception as e:
             logger.error(f"Error in calculate_access_windows: {str(e)}")
-            raise
-    
-    async def _handle_calculate_access_events(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle calculate_access_events tool call."""
-        try:
-            # Extract and validate arguments
-            latitude = float(arguments["latitude"])
-            longitude = float(arguments["longitude"])
-            tle_line1 = str(arguments["tle_line1"])
-            tle_line2 = str(arguments["tle_line2"])
-            start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
-            satellite_id = str(arguments["satellite_id"])
-            location_id = str(arguments["location_id"])
-            location_type = str(arguments.get("location_type", "ground_station"))
-            elevation_threshold = float(arguments.get("elevation_threshold", 10.0))
-            time_step_seconds = int(arguments.get("time_step_seconds", 30))
-            
-            # Calculate access events
-            access_events = self.calculator.calculate_access_events(
-                latitude=latitude,
-                longitude=longitude,
-                tle_line1=tle_line1,
-                tle_line2=tle_line2,
-                start_time=start_time,
-                end_time=end_time,
-                satellite_id=satellite_id,
-                location_id=location_id,
-                location_type=location_type,
-                elevation_threshold=elevation_threshold,
-                time_step_seconds=time_step_seconds
-            )
-            
-            # Format for InfluxDB
-            influxdb_events = self.calculator.format_for_influxdb(access_events)
-            
-            # Format response
-            events_data = []
-            for event in access_events:
-                event_dict = {
-                    "timestamp": event.timestamp.isoformat(),
-                    "event_type": event.event_type,
-                    "elevation_deg": round(event.elevation_deg, 2),
-                    "azimuth_deg": round(event.azimuth_deg, 2),
-                    "satellite_id": event.satellite_id,
-                    "location_id": event.location_id,
-                    "location_type": event.location_type
-                }
-                events_data.append(event_dict)
-            
-            response = {
-                "summary": {
-                    "total_events": len(access_events),
-                    "aos_events": len([e for e in access_events if e.event_type == "aos"]),
-                    "culmination_events": len([e for e in access_events if e.event_type == "culmination"]),
-                    "los_events": len([e for e in access_events if e.event_type == "los"]),
-                    "calculation_parameters": {
-                        "latitude": latitude,
-                        "longitude": longitude,
-                        "satellite_id": satellite_id,
-                        "location_id": location_id,
-                        "location_type": location_type,
-                        "start_time": start_time.isoformat(),
-                        "end_time": end_time.isoformat(),
-                        "elevation_threshold": elevation_threshold,
-                        "time_step_seconds": time_step_seconds
-                    }
-                },
-                "events": events_data,
-                "influxdb_format": influxdb_events
-            }
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(response, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in calculate_access_events: {str(e)}")
             raise
     
     async def _handle_validate_tle(self, arguments: Dict[str, Any]) -> CallToolResult:
@@ -420,6 +310,35 @@ class SatelliteMCPServer:
             
         except Exception as e:
             logger.error(f"Error in validate_tle: {str(e)}")
+            raise
+    
+    async def _handle_calculate_bulk_access_windows(self, arguments: Dict[str, Any]) -> CallToolResult:
+        """Handle calculate_bulk_access_windows tool call."""
+        try:
+            # Extract and validate arguments
+            locations_csv = str(arguments["locations_csv"])
+            satellites_csv = str(arguments["satellites_csv"])
+            start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+            end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+            elevation_threshold = float(arguments.get("elevation_threshold", 10.0))
+            time_step_seconds = int(arguments.get("time_step_seconds", 30))
+            
+            # Calculate bulk access windows
+            bulk_results = self.calculator.calculate_bulk_access_windows(
+                locations_csv=locations_csv,
+                satellites_csv=satellites_csv,
+                start_time=start_time,
+                end_time=end_time,
+                elevation_threshold=elevation_threshold,
+                time_step_seconds=time_step_seconds
+            )
+            
+            return CallToolResult(
+                content=[TextContent(type="text", text=json.dumps(bulk_results, indent=2))]
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in calculate_bulk_access_windows: {str(e)}")
             raise
     
     async def run(self):

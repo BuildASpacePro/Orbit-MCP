@@ -87,10 +87,10 @@ quality: lint type-check format-check ## Run all code quality checks
 
 # Docker targets
 docker-build: ## Build Docker image
-	$(DOCKER) build -f docker/Dockerfile -t $(IMAGE_NAME):latest .
+	$(DOCKER) build -f Dockerfile -t $(IMAGE_NAME):latest .
 
 docker-build-dev: ## Build Docker image for development
-	$(DOCKER) build -f docker/Dockerfile -t $(IMAGE_NAME):dev --target builder .
+	$(DOCKER) build -f Dockerfile -t $(IMAGE_NAME):dev --target builder .
 
 docker-run: ## Run Docker container
 	$(DOCKER) run -it --rm --name $(CONTAINER_NAME) $(IMAGE_NAME):latest
@@ -107,23 +107,23 @@ docker-clean: ## Remove Docker container and image
 	$(DOCKER) rmi $(IMAGE_NAME):dev || true
 
 docker-compose-up: ## Start services with docker-compose
-	cd docker && $(DOCKER_COMPOSE) up -d
+	$(DOCKER_COMPOSE) up -d
 
 docker-compose-down: ## Stop services with docker-compose
-	cd docker && $(DOCKER_COMPOSE) down
+	$(DOCKER_COMPOSE) down
 
 docker-compose-logs: ## View docker-compose logs
-	cd docker && $(DOCKER_COMPOSE) logs -f
+	$(DOCKER_COMPOSE) logs -f
 
 # Development targets
 run: ## Run MCP server locally
-	$(PYTHON) -m $(SRC_DIR).mcp_server
+	$(PYTHON) -m $(SRC_DIR).mcp_server_standalone
 
 run-dev: ## Run MCP server in development mode with logging
-	MCP_SERVER_LOG_LEVEL=DEBUG $(PYTHON) -m $(SRC_DIR).mcp_server
+	MCP_SERVER_LOG_LEVEL=DEBUG $(PYTHON) -m $(SRC_DIR).mcp_server_standalone
 
 debug: ## Run with Python debugger
-	$(PYTHON) -m pdb -m $(SRC_DIR).mcp_server
+	$(PYTHON) -m pdb -m $(SRC_DIR).mcp_server_standalone
 
 # Validation and benchmarking
 validate: ## Validate TLE data and calculations

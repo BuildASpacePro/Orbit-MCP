@@ -7,9 +7,11 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 
 import numpy as np
-from skyfield.api import Topos, load, EarthSatellite
+from skyfield.api import Topos, load, EarthSatellite, wgs84
 from skyfield.timelib import Time
 from skyfield.units import Angle
+from skyfield.almanac import find_discrete, risings_and_settings
+from skyfield.searchlib import find_minima
 
 
 logger = logging.getLogger(__name__)
@@ -26,18 +28,11 @@ class AccessWindow:
     aos_azimuth_deg: float
     los_azimuth_deg: float
     culmination_azimuth_deg: float
+    # Lighting conditions during culmination
+    ground_lighting: Dict[str, Any]  # Dawn/dusk conditions at ground station
+    satellite_lighting: Dict[str, Any]  # Sunlight/eclipse conditions for satellite
 
 
-@dataclass
-class AccessEvent:
-    """Individual satellite access event (AOS, Culmination, LOS)."""
-    timestamp: datetime
-    event_type: str  # "aos", "culmination", "los"
-    elevation_deg: float
-    azimuth_deg: float
-    satellite_id: str
-    location_id: str
-    location_type: str
 
 
 @dataclass
@@ -61,6 +56,9 @@ class SatelliteCalculator:
     def __init__(self):
         """Initialize calculator with Skyfield timescale."""
         self.ts = load.timescale()
+        self.eph = load('de421.bsp')  # Load planetary ephemeris
+        self.sun = self.eph['sun']
+        self.earth = self.eph['earth']
     
     def validate_tle(self, line1: str, line2: str) -> TLEValidationResult:
         """Validate Two-Line Element data and extract orbital parameters."""
@@ -135,9 +133,10 @@ class SatelliteCalculator:
                 epoch_year = int(line1[18:20])
                 epoch_year += 2000 if epoch_year < 57 else 1900  # Two-digit year logic
                 epoch_day = float(line1[20:32])
+                from datetime import timedelta
                 epoch = datetime(epoch_year, 1, 1, tzinfo=timezone.utc)
-                epoch = epoch.replace(day=1) + np.timedelta64(int(epoch_day - 1), 'D')
-                epoch = epoch + np.timedelta64(int((epoch_day % 1) * 24 * 3600 * 1000), 'ms')
+                epoch = epoch.replace(day=1) + timedelta(days=int(epoch_day - 1))
+                epoch = epoch + timedelta(milliseconds=int((epoch_day % 1) * 24 * 3600 * 1000))
                 
                 # Orbital parameters
                 inclination_deg = float(line2[8:16])
@@ -168,6 +167,86 @@ class SatelliteCalculator:
             inclination_deg=inclination_deg,
             orbital_period_minutes=orbital_period_minutes
         )
+    
+    def calculate_ground_lighting(self, latitude: float, longitude: float, timestamp: datetime) -> Dict[str, Any]:
+        """Calculate ground lighting conditions at a specific time and location."""
+        # Convert to Skyfield time
+        t = self.ts.from_datetime(timestamp.replace(tzinfo=timezone.utc))
+        
+        # Create ground location object
+        location = wgs84.latlon(latitude, longitude)
+        
+        # Calculate sun position
+        sun_apparent = (self.earth + location).at(t).observe(self.sun).apparent()
+        sun_alt, sun_az, _ = sun_apparent.altaz()
+        
+        sun_elevation = sun_alt.degrees
+        
+        # Determine lighting conditions based on sun elevation
+        if sun_elevation > -0.833:  # Above horizon (accounting for atmospheric refraction)
+            condition = "daylight"
+        elif sun_elevation > -6:  # Civil twilight
+            condition = "civil_twilight"
+        elif sun_elevation > -12:  # Nautical twilight
+            condition = "nautical_twilight"
+        elif sun_elevation > -18:  # Astronomical twilight
+            condition = "astronomical_twilight"
+        else:
+            condition = "night"
+        
+        return {
+            "condition": condition,
+            "sun_elevation_deg": round(sun_elevation, 2),
+            "sun_azimuth_deg": round(sun_az.degrees, 2),
+            "civil_twilight": sun_elevation > -6,
+            "nautical_twilight": sun_elevation > -12,
+            "astronomical_twilight": sun_elevation > -18,
+            "is_daylight": sun_elevation > -0.833,
+            "is_night": sun_elevation <= -18
+        }
+    
+    def calculate_satellite_lighting(self, satellite: EarthSatellite, timestamp: datetime) -> Dict[str, Any]:
+        """Calculate satellite lighting conditions (sunlight/eclipse) at a specific time."""
+        # Convert to Skyfield time
+        t = self.ts.from_datetime(timestamp.replace(tzinfo=timezone.utc))
+        
+        # Get satellite position
+        geocentric = satellite.at(t)
+        
+        # Get satellite's subpoint for ground lighting reference
+        sat_lat = geocentric.subpoint().latitude.degrees
+        sat_lon = geocentric.subpoint().longitude.degrees
+        
+        # Calculate ground lighting at satellite's subpoint
+        ground_lighting = self.calculate_ground_lighting(sat_lat, sat_lon, timestamp)
+        
+        # Get satellite position vector
+        sat_position = geocentric.position.km
+        sat_distance = np.linalg.norm(sat_position)
+        
+        # Simplified eclipse calculation: 
+        # Satellite is in eclipse if it's on the night side of Earth
+        # This is an approximation based on the ground track lighting
+        
+        # For LEO satellites, use ground track lighting as approximation
+        # For higher satellites, they're more likely to be in sunlight
+        in_eclipse = False
+        if sat_distance < 2000:  # LEO satellites (below ~2000km)
+            in_eclipse = ground_lighting["condition"] in ["night", "astronomical_twilight"]
+        elif sat_distance < 20000:  # MEO satellites
+            in_eclipse = ground_lighting["condition"] == "night"
+        # GEO and higher satellites are rarely in eclipse, so default to sunlight
+        
+        return {
+            "condition": "eclipse" if in_eclipse else "sunlight",
+            "in_eclipse": in_eclipse,
+            "in_sunlight": not in_eclipse,
+            "satellite_altitude_km": round(sat_distance - 6371, 2),  # Altitude above Earth surface
+            "subpoint_latitude": round(sat_lat, 4),
+            "subpoint_longitude": round(sat_lon, 4),
+            "ground_track_lighting": ground_lighting["condition"],
+            "eclipse_calculation": "simplified_altitude_based"
+        }
     
     def calculate_access_windows(
         self,
@@ -255,6 +334,10 @@ class SatelliteCalculator:
                 
                 duration_seconds = (los_time - aos_time).total_seconds()
                 
+                # Calculate lighting conditions at culmination
+                ground_lighting = self.calculate_ground_lighting(latitude, longitude, culmination_time)
+                satellite_lighting = self.calculate_satellite_lighting(satellite, culmination_time)
+                
                 access_window = AccessWindow(
                     aos_time=aos_time,
                     los_time=los_time,
@@ -263,7 +346,9 @@ class SatelliteCalculator:
                     max_elevation_deg=max_elevation,
                     aos_azimuth_deg=azimuth.degrees[aos_idx],
                     los_azimuth_deg=azimuth.degrees[los_idx],
-                    culmination_azimuth_deg=azimuth.degrees[culmination_idx]
+                    culmination_azimuth_deg=azimuth.degrees[culmination_idx],
+                    ground_lighting=ground_lighting,
+                    satellite_lighting=satellite_lighting
                 )
                 
                 access_windows.append(access_window)
@@ -277,6 +362,10 @@ class SatelliteCalculator:
             
             duration_seconds = (los_time - aos_time).total_seconds()
             
+            # Calculate lighting conditions at culmination
+            ground_lighting = self.calculate_ground_lighting(latitude, longitude, culmination_time)
+            satellite_lighting = self.calculate_satellite_lighting(satellite, culmination_time)
+            
             access_window = AccessWindow(
                 aos_time=aos_time,
                 los_time=los_time,
@@ -285,7 +374,9 @@ class SatelliteCalculator:
                 max_elevation_deg=max_elevation,
                 aos_azimuth_deg=azimuth.degrees[aos_idx],
                 los_azimuth_deg=azimuth.degrees[los_idx],
-                culmination_azimuth_deg=azimuth.degrees[culmination_idx]
+                culmination_azimuth_deg=azimuth.degrees[culmination_idx],
+                ground_lighting=ground_lighting,
+                satellite_lighting=satellite_lighting
             )
             
             access_windows.append(access_window)
@@ -293,88 +384,267 @@ class SatelliteCalculator:
         logger.info(f"Found {len(access_windows)} access windows")
         return access_windows
     
-    def calculate_access_events(
+    def parse_locations_from_csv_content(self, csv_content: str) -> List[Dict[str, Any]]:
+        """Parse locations from CSV content with flexible format handling."""
+        import csv
+        import io
+        
+        lines = csv_content.strip().split('\n')
+        if not lines:
+            raise ValueError("CSV content is empty")
+        
+        # Parse header to identify columns
+        reader = csv.DictReader(io.StringIO(csv_content))
+        
+        locations = []
+        for row_num, row in enumerate(reader, 1):
+            try:
+                location = {}
+                
+                # Find latitude column (flexible naming)
+                lat_keys = ['latitude', 'lat', 'Latitude', 'Lat', 'LATITUDE', 'LAT']
+                lat_value = None
+                for key in lat_keys:
+                    if key in row and row[key].strip():
+                        lat_value = float(row[key])
+                        break
+                
+                if lat_value is None:
+                    raise ValueError(f"No latitude column found in row {row_num}")
+                
+                # Find longitude column (flexible naming)
+                lon_keys = ['longitude', 'lon', 'lng', 'Longitude', 'Lon', 'Lng', 'LONGITUDE', 'LON', 'LNG']
+                lon_value = None
+                for key in lon_keys:
+                    if key in row and row[key].strip():
+                        lon_value = float(row[key])
+                        break
+                
+                if lon_value is None:
+                    raise ValueError(f"No longitude column found in row {row_num}")
+                
+                # Find altitude column (optional, default to sea level)
+                alt_keys = ['altitude', 'alt', 'elevation', 'elev', 'Altitude', 'Alt', 'Elevation', 'Elev']
+                alt_value = 0.0  # Default to sea level
+                for key in alt_keys:
+                    if key in row and row[key].strip():
+                        alt_value = float(row[key])
+                        break
+                
+                # Find name column (optional)
+                name_keys = ['name', 'Name', 'NAME', 'site', 'Site', 'SITE', 'station', 'Station', 'STATION']
+                name_value = f"Location_{row_num}"  # Default name
+                for key in name_keys:
+                    if key in row and row[key].strip():
+                        name_value = row[key].strip()
+                        break
+                
+                location = {
+                    'name': name_value,
+                    'latitude': lat_value,
+                    'longitude': lon_value,
+                    'altitude': alt_value
+                }
+                
+                # Validate coordinates
+                if not (-90 <= lat_value <= 90):
+                    raise ValueError(f"Invalid latitude {lat_value} in row {row_num}")
+                if not (-180 <= lon_value <= 180):
+                    raise ValueError(f"Invalid longitude {lon_value} in row {row_num}")
+                
+                locations.append(location)
+                
+            except Exception as e:
+                logger.warning(f"Skipping row {row_num}: {str(e)}")
+                continue
+        
+        if not locations:
+            raise ValueError("No valid locations found in CSV")
+        
+        logger.info(f"Parsed {len(locations)} locations from CSV")
+        return locations
+    
+    def parse_satellites_from_csv_content(self, csv_content: str) -> List[Dict[str, Any]]:
+        """Parse satellites from CSV content with TLE data."""
+        import csv
+        import io
+        
+        lines = csv_content.strip().split('\n')
+        if not lines:
+            raise ValueError("CSV content is empty")
+        
+        reader = csv.DictReader(io.StringIO(csv_content))
+        
+        satellites = []
+        for row_num, row in enumerate(reader, 1):
+            try:
+                satellite = {}
+                
+                # Find name column
+                name_keys = ['name', 'Name', 'NAME', 'satellite', 'Satellite', 'SATELLITE', 'sat_name']
+                name_value = f"Satellite_{row_num}"
+                for key in name_keys:
+                    if key in row and row[key].strip():
+                        name_value = row[key].strip()
+                        break
+                
+                # Find TLE line 1
+                tle1_keys = ['tle_line1', 'tle1', 'line1', 'TLE_LINE1', 'TLE1', 'LINE1']
+                tle1_value = None
+                for key in tle1_keys:
+                    if key in row and row[key].strip():
+                        tle1_value = row[key].strip()
+                        break
+                
+                if not tle1_value:
+                    raise ValueError(f"No TLE line 1 found in row {row_num}")
+                
+                # Find TLE line 2
+                tle2_keys = ['tle_line2', 'tle2', 'line2', 'TLE_LINE2', 'TLE2', 'LINE2']
+                tle2_value = None
+                for key in tle2_keys:
+                    if key in row and row[key].strip():
+                        tle2_value = row[key].strip()
+                        break
+                
+                if not tle2_value:
+                    raise ValueError(f"No TLE line 2 found in row {row_num}")
+                
+                # Validate TLE
+                tle_validation = self.validate_tle(tle1_value, tle2_value)
+                if not tle_validation.is_valid:
+                    raise ValueError(f"Invalid TLE: {'; '.join(tle_validation.errors)}")
+                
+                satellite = {
+                    'name': name_value,
+                    'tle_line1': tle1_value,
+                    'tle_line2': tle2_value
+                }
+                
+                satellites.append(satellite)
+                
+            except Exception as e:
+                logger.warning(f"Skipping satellite row {row_num}: {str(e)}")
+                continue
+        
+        if not satellites:
+            raise ValueError("No valid satellites found in CSV")
+        
+        logger.info(f"Parsed {len(satellites)} satellites from CSV")
+        return satellites
+    
+    def calculate_bulk_access_windows(
         self,
-        latitude: float,
-        longitude: float,
-        tle_line1: str,
-        tle_line2: str,
+        locations_csv: str,
+        satellites_csv: str,
         start_time: datetime,
         end_time: datetime,
-        satellite_id: str,
-        location_id: str,
-        location_type: str = "ground_station",
         elevation_threshold: float = 10.0,
         time_step_seconds: int = 30
-    ) -> List[AccessEvent]:
-        """Calculate detailed access events for InfluxDB-compatible output."""
+    ) -> Dict[str, Any]:
+        """Calculate access windows for multiple satellites and locations."""
         
-        access_windows = self.calculate_access_windows(
-            latitude, longitude, tle_line1, tle_line2,
-            start_time, end_time, elevation_threshold, time_step_seconds
-        )
+        # Parse locations and satellites from CSV content
+        locations = self.parse_locations_from_csv_content(locations_csv)
+        satellites = self.parse_satellites_from_csv_content(satellites_csv)
         
-        events = []
+        results = {
+            'summary': {
+                'total_locations': len(locations),
+                'total_satellites': len(satellites),
+                'total_combinations': len(locations) * len(satellites),
+                'calculation_parameters': {
+                    'start_time': start_time.isoformat(),
+                    'end_time': end_time.isoformat(),
+                    'elevation_threshold': elevation_threshold,
+                    'time_step_seconds': time_step_seconds
+                }
+            },
+            'results': []
+        }
         
-        for window in access_windows:
-            # AOS event
-            events.append(AccessEvent(
-                timestamp=window.aos_time,
-                event_type="aos",
-                elevation_deg=elevation_threshold,  # Approximation at threshold
-                azimuth_deg=window.aos_azimuth_deg,
-                satellite_id=satellite_id,
-                location_id=location_id,
-                location_type=location_type
-            ))
-            
-            # Culmination event
-            events.append(AccessEvent(
-                timestamp=window.culmination_time,
-                event_type="culmination",
-                elevation_deg=window.max_elevation_deg,
-                azimuth_deg=window.culmination_azimuth_deg,
-                satellite_id=satellite_id,
-                location_id=location_id,
-                location_type=location_type
-            ))
-            
-            # LOS event
-            events.append(AccessEvent(
-                timestamp=window.los_time,
-                event_type="los",
-                elevation_deg=elevation_threshold,  # Approximation at threshold
-                azimuth_deg=window.los_azimuth_deg,
-                satellite_id=satellite_id,
-                location_id=location_id,
-                location_type=location_type
-            ))
+        total_combinations = len(locations) * len(satellites)
+        current_combination = 0
         
-        # Sort events by timestamp
-        events.sort(key=lambda x: x.timestamp)
+        for location in locations:
+            for satellite in satellites:
+                current_combination += 1
+                logger.info(f"Processing combination {current_combination}/{total_combinations}: {satellite['name']} over {location['name']}")
+                
+                try:
+                    access_windows = self.calculate_access_windows(
+                        latitude=location['latitude'],
+                        longitude=location['longitude'],
+                        tle_line1=satellite['tle_line1'],
+                        tle_line2=satellite['tle_line2'],
+                        start_time=start_time,
+                        end_time=end_time,
+                        elevation_threshold=elevation_threshold,
+                        time_step_seconds=time_step_seconds
+                    )
+                    
+                    # Format windows data
+                    windows_data = []
+                    total_duration = 0.0
+                    max_elevation = 0.0
+                    
+                    for window in access_windows:
+                        window_dict = {
+                            "aos_time": window.aos_time.isoformat(),
+                            "los_time": window.los_time.isoformat(),
+                            "culmination_time": window.culmination_time.isoformat(),
+                            "duration_seconds": window.duration_seconds,
+                            "duration_minutes": round(window.duration_seconds / 60.0, 2),
+                            "max_elevation_deg": round(window.max_elevation_deg, 2),
+                            "aos_azimuth_deg": round(window.aos_azimuth_deg, 2),
+                            "los_azimuth_deg": round(window.los_azimuth_deg, 2),
+                            "culmination_azimuth_deg": round(window.culmination_azimuth_deg, 2),
+                            "ground_lighting": window.ground_lighting,
+                            "satellite_lighting": window.satellite_lighting
+                        }
+                        windows_data.append(window_dict)
+                        total_duration += window.duration_seconds
+                        max_elevation = max(max_elevation, window.max_elevation_deg)
+                    
+                    combination_result = {
+                        'satellite': satellite,
+                        'location': location,
+                        'access_windows': windows_data,
+                        'summary': {
+                            'total_windows': len(access_windows),
+                            'total_duration_seconds': total_duration,
+                            'total_duration_minutes': round(total_duration / 60.0, 2),
+                            'max_elevation_deg': round(max_elevation, 2)
+                        }
+                    }
+                    
+                    results['results'].append(combination_result)
+                    
+                except Exception as e:
+                    logger.error(f"Error calculating windows for {satellite['name']} over {location['name']}: {str(e)}")
+                    # Add error result
+                    combination_result = {
+                        'satellite': satellite,
+                        'location': location,
+                        'access_windows': [],
+                        'error': str(e),
+                        'summary': {
+                            'total_windows': 0,
+                            'total_duration_seconds': 0,
+                            'total_duration_minutes': 0,
+                            'max_elevation_deg': 0
+                        }
+                    }
+                    results['results'].append(combination_result)
         
-        logger.info(f"Generated {len(events)} access events")
-        return events
+        # Calculate overall summary statistics
+        total_windows = sum(r['summary']['total_windows'] for r in results['results'])
+        total_duration = sum(r['summary']['total_duration_seconds'] for r in results['results'])
+        
+        results['summary']['total_access_windows'] = total_windows
+        results['summary']['total_access_duration_seconds'] = total_duration
+        results['summary']['total_access_duration_minutes'] = round(total_duration / 60.0, 2)
+        
+        logger.info(f"Bulk calculation completed: {total_windows} total access windows found")
+        return results
     
-    def format_for_influxdb(self, events: List[AccessEvent]) -> List[Dict[str, Any]]:
-        """Format access events for InfluxDB line protocol."""
-        formatted_events = []
-        
-        for event in events:
-            formatted_event = {
-                "measurement": "satellite_access",
-                "tags": {
-                    "satellite_id": event.satellite_id,
-                    "location_id": event.location_id,
-                    "location_type": event.location_type,
-                    "event_type": event.event_type
-                },
-                "fields": {
-                    "elevation_deg": event.elevation_deg,
-                    "azimuth_deg": event.azimuth_deg
-                },
-                "time": event.timestamp.isoformat()
-            }
-            formatted_events.append(formatted_event)
-        
-        return formatted_events

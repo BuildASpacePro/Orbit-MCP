@@ -6,9 +6,9 @@ A complete Model Context Protocol (MCP) server for satellite orbital mechanics c
 
 The Satellite MCP Server provides three main capabilities:
 
-1. **Access Window Calculations** - Determine when satellites are visible above a specified elevation from ground locations
-2. **Detailed Event Streaming** - Generate AOS/Culmination/LOS events in InfluxDB-compatible format
-3. **TLE Validation** - Validate and parse Two-Line Element orbital data
+1. **Enhanced Access Window Calculations** - Determine when satellites are visible with comprehensive lighting conditions (all twilight types) for both ground and satellite
+2. **Bulk Calculations** - Process multiple satellites and ground locations from CSV data with flexible column naming
+3. **TLE Validation** - Validate and parse Two-Line Element orbital data with detailed orbital parameters
 
 Built with Python 3.11+, Skyfield orbital mechanics library, and full Docker containerization for production deployment.
 
@@ -45,7 +45,6 @@ make docker-build
 make docker-run
 
 # Or use docker-compose for full stack
-cd docker
 docker-compose up -d
 ```
 
@@ -54,30 +53,41 @@ docker-compose up -d
 ### Core Calculations
 
 - **Precise Orbital Propagation** using Skyfield SGP4/SDP4 models
+- **Comprehensive Lighting Analysis** - Civil, nautical, and astronomical twilight conditions
+- **Ground Station Lighting** - Sun elevation and twilight status at target locations
+- **Satellite Lighting** - Eclipse/sunlight conditions with altitude-based approximations
 - **Topocentric Coordinate Transformations** (TEME to local horizon)
 - **Configurable Time Stepping** for accuracy vs performance tuning
-- **Multiple Satellite Support** with any valid TLE data
+
+### Bulk Processing
+
+- **CSV Data Input** with flexible column naming support
+- **Multiple Satellite Support** - Process entire constellations
+- **Multiple Ground Stations** - Simultaneous calculations across networks
+- **Resilient Parsing** - Handles variations in CSV format and missing data
+- **Comprehensive Results** - Organized by satellite-location combinations
 
 ### MCP Integration
 
+- **Three Specialized Tools** - Access windows, bulk calculations, and TLE validation
 - **JSON-RPC 2.0 Protocol** for AI assistant communication
 - **Schema Validation** with detailed error messages
 - **Async Execution** for long-running calculations
-- **Structured Responses** with summary statistics
+- **Enhanced Data Structures** with lighting information
 
 ### Production Features
 
 - **Docker Containerization** with multi-stage builds
+- **Simplified Deployment** - Docker files in project root
 - **Health Checks** and proper signal handling
 - **Logging and Monitoring** with configurable levels
 - **Resource Management** and cleanup
-- **Security** with non-root user execution
 
 ## 🛠️ Tools
 
 ### calculate_access_windows
 
-Calculates satellite access windows over a ground station location.
+Calculates satellite access windows over a ground station location with comprehensive lighting conditions.
 
 **Input Parameters:**
 - `latitude` (float): Ground station latitude (-90 to 90 degrees)
@@ -109,45 +119,66 @@ Calculates satellite access windows over a ground station location.
       "max_elevation_deg": 78.3,
       "aos_azimuth_deg": 291.7,
       "los_azimuth_deg": 76.2,
-      "culmination_azimuth_deg": 2.1
+      "culmination_azimuth_deg": 2.1,
+      "ground_lighting": {
+        "condition": "daylight",
+        "sun_elevation_deg": 45.2,
+        "civil_twilight": true,
+        "nautical_twilight": true,
+        "astronomical_twilight": true,
+        "is_daylight": true,
+        "is_night": false
+      },
+      "satellite_lighting": {
+        "condition": "sunlight",
+        "in_eclipse": false,
+        "in_sunlight": true,
+        "satellite_altitude_km": 420.5
+      }
     }
   ]
 }
 ```
 
-### calculate_access_events
+### calculate_bulk_access_windows
 
-Generates detailed access events for InfluxDB-compatible output.
+Calculates access windows for multiple satellites and ground locations from CSV data.
 
-**Additional Input Parameters:**
-- `satellite_id` (string): Unique satellite identifier
-- `location_id` (string): Unique ground station identifier
-- `location_type` (string, optional): Location type (default: "ground_station")
+**Input Parameters:**
+- `locations_csv` (string): CSV content with ground locations (columns: name, latitude, longitude, altitude)
+- `satellites_csv` (string): CSV content with satellite TLE data (columns: name, tle_line1, tle_line2)
+- `start_time` (string): Start time in ISO 8601 format (UTC)
+- `end_time` (string): End time in ISO 8601 format (UTC)
+- `elevation_threshold` (float, optional): Minimum elevation angle (default: 10°)
+- `time_step_seconds` (int, optional): Calculation time step (default: 30s)
+
+**CSV Format Examples:**
+```csv
+# Locations CSV (flexible column naming)
+name,latitude,longitude,altitude
+MIT,42.3601,-71.0942,40
+NASA Goddard,38.9917,-76.8400,76
+
+# Satellites CSV  
+name,tle_line1,tle_line2
+ISS,1 25544U 98067A...,2 25544  51.6400...
+```
 
 **Output:**
 ```json
 {
   "summary": {
-    "total_events": 15,
-    "aos_events": 5,
-    "culmination_events": 5,
-    "los_events": 5
+    "total_locations": 2,
+    "total_satellites": 1,
+    "total_combinations": 2,
+    "total_access_windows": 8
   },
-  "events": [ ... ],
-  "influxdb_format": [
+  "results": [
     {
-      "measurement": "satellite_access",
-      "tags": {
-        "satellite_id": "25544",
-        "location_id": "MIT_LL",
-        "location_type": "ground_station",
-        "event_type": "aos"
-      },
-      "fields": {
-        "elevation_deg": 10.0,
-        "azimuth_deg": 291.7
-      },
-      "time": "2024-01-01T06:12:30"
+      "satellite": {"name": "ISS", ...},
+      "location": {"name": "MIT", ...},
+      "access_windows": [...],
+      "summary": {"total_windows": 4}
     }
   ]
 }
@@ -278,21 +309,16 @@ make docker-run-background
 ### Full Stack with Docker Compose
 
 ```bash
-cd docker
 docker-compose up -d
 ```
 
-Includes optional services:
-- **InfluxDB** - Time series database for satellite events
-- **Grafana** - Visualization dashboard
+The docker-compose stack includes the MCP server ready for integration with AI assistants.
 
 ### Configuration
 
 Environment variables:
 - `MCP_SERVER_LOG_LEVEL` - Logging level (DEBUG, INFO, WARNING, ERROR)
 - `TZ` - Timezone (default: UTC)
-- `INFLUXDB_ADMIN_USER` - InfluxDB admin username
-- `INFLUXDB_ADMIN_PASSWORD` - InfluxDB admin password
 
 ## 🔧 Development
 

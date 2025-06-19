@@ -3,7 +3,14 @@
 import pytest
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
+try:
+    from unittest.mock import AsyncMock
+except ImportError:
+    # AsyncMock not available in Python < 3.8
+    class AsyncMock(MagicMock):
+        async def __call__(self, *args, **kwargs):
+            return super(AsyncMock, self).__call__(*args, **kwargs)
 from datetime import datetime, timezone
 
 from mcp.types import CallToolRequest, CallToolRequestParams
@@ -41,7 +48,7 @@ class TestMCPServerTools:
         
         tool_names = [tool.name for tool in result.tools]
         assert "calculate_access_windows" in tool_names
-        assert "calculate_access_events" in tool_names
+        assert "calculate_bulk_access_windows" in tool_names
         assert "validate_tle" in tool_names
         
         # Validate tool schemas

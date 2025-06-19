@@ -4,7 +4,7 @@ import pytest
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
-from src.satellite_calc import SatelliteCalculator, AccessWindow, AccessEvent, TLEValidationResult
+from src.satellite_calc import SatelliteCalculator, AccessWindow, TLEValidationResult
 from tests.sample_data import (
     ISS_TLE, NOAA_18_TLE, HUBBLE_TLE, INVALID_TLE,
     GROUND_STATIONS, TEST_TIME_WINDOWS, EXPECTED_RESULTS, TEST_PARAMETERS
@@ -234,8 +234,8 @@ class TestAccessWindowCalculations:
             )
 
 
-class TestAccessEvents:
-    """Test access event calculation functionality."""
+class TestLightingConditions:
+    """Test lighting condition calculations."""
     
     def setup_method(self):
         """Set up test fixtures."""
@@ -243,86 +243,72 @@ class TestAccessEvents:
         self.mit_station = GROUND_STATIONS["MIT"]
         self.single_day = TEST_TIME_WINDOWS["SINGLE_DAY"]
     
-    def test_calculate_access_events(self):
-        """Test access event calculation."""
-        events = self.calculator.calculate_access_events(
-            latitude=self.mit_station["latitude"],
-            longitude=self.mit_station["longitude"],
-            tle_line1=ISS_TLE["line1"],
-            tle_line2=ISS_TLE["line2"],
-            start_time=self.single_day["start"],
-            end_time=self.single_day["end"],
-            satellite_id=ISS_TLE["satellite_id"],
-            location_id=self.mit_station["location_id"],
-            location_type=self.mit_station["location_type"]
-        )
+    def test_ground_lighting_calculation(self):
+        """Test ground lighting condition calculation."""
+        # Test different times of day
+        from datetime import datetime, timezone, timedelta
         
-        # Should have events
-        assert len(events) > 0
+        # Test at different times
+        test_times = [
+            datetime(2024, 6, 21, 6, 0, 0, tzinfo=timezone.utc),   # Early morning
+            datetime(2024, 6, 21, 12, 0, 0, tzinfo=timezone.utc),  # Noon
+            datetime(2024, 6, 21, 18, 0, 0, tzinfo=timezone.utc),  # Evening
+            datetime(2024, 6, 21, 0, 0, 0, tzinfo=timezone.utc),   # Midnight
+        ]
         
-        # Events should be sorted by time
-        for i in range(1, len(events)):
-            assert events[i-1].timestamp <= events[i].timestamp
-        
-        # Count event types
-        aos_events = [e for e in events if e.event_type == "aos"]
-        culmination_events = [e for e in events if e.event_type == "culmination"]
-        los_events = [e for e in events if e.event_type == "los"]
-        
-        # Should have equal numbers of each event type
-        assert len(aos_events) == len(culmination_events) == len(los_events)
-        
-        # Validate event structure
-        for event in events:
-            assert isinstance(event, AccessEvent)
-            assert event.event_type in ["aos", "culmination", "los"]
-            assert event.satellite_id == ISS_TLE["satellite_id"]
-            assert event.location_id == self.mit_station["location_id"]
-            assert event.location_type == self.mit_station["location_type"]
-            assert 0 <= event.azimuth_deg <= 360
-            assert event.elevation_deg >= 0
+        for test_time in test_times:
+            lighting = self.calculator.calculate_ground_lighting(
+                self.mit_station["latitude"],
+                self.mit_station["longitude"],
+                test_time
+            )
+            
+            # Validate lighting structure
+            assert "condition" in lighting
+            assert "sun_elevation_deg" in lighting
+            assert "sun_azimuth_deg" in lighting
+            assert "civil_twilight" in lighting
+            assert "nautical_twilight" in lighting
+            assert "astronomical_twilight" in lighting
+            assert "is_daylight" in lighting
+            assert "is_night" in lighting
+            
+            # Validate condition values
+            assert lighting["condition"] in [
+                "daylight", "civil_twilight", "nautical_twilight", 
+                "astronomical_twilight", "night"
+            ]
+            
+            # Validate angle ranges
+            assert -90 <= lighting["sun_elevation_deg"] <= 90
+            assert 0 <= lighting["sun_azimuth_deg"] <= 360
     
-    def test_influxdb_formatting(self):
-        """Test InfluxDB format conversion."""
-        events = self.calculator.calculate_access_events(
+    def test_access_windows_with_lighting(self):
+        """Test that access windows include lighting information."""
+        windows = self.calculator.calculate_access_windows(
             latitude=self.mit_station["latitude"],
             longitude=self.mit_station["longitude"],
             tle_line1=ISS_TLE["line1"],
             tle_line2=ISS_TLE["line2"],
             start_time=self.single_day["start"],
-            end_time=self.single_day["end"],
-            satellite_id=ISS_TLE["satellite_id"],
-            location_id=self.mit_station["location_id"]
+            end_time=self.single_day["end"]
         )
         
-        influx_events = self.calculator.format_for_influxdb(events)
+        assert len(windows) > 0
         
-        assert len(influx_events) == len(events)
-        
-        for influx_event in influx_events:
-            # Validate InfluxDB format structure
-            assert "measurement" in influx_event
-            assert "tags" in influx_event
-            assert "fields" in influx_event
-            assert "time" in influx_event
+        for window in windows:
+            # Validate that lighting information is present
+            assert hasattr(window, 'ground_lighting')
+            assert hasattr(window, 'satellite_lighting')
             
-            assert influx_event["measurement"] == "satellite_access"
+            # Validate ground lighting structure
+            assert "condition" in window.ground_lighting
+            assert "sun_elevation_deg" in window.ground_lighting
             
-            # Validate tags
-            tags = influx_event["tags"]
-            assert "satellite_id" in tags
-            assert "location_id" in tags
-            assert "location_type" in tags
-            assert "event_type" in tags
-            
-            # Validate fields
-            fields = influx_event["fields"]
-            assert "elevation_deg" in fields
-            assert "azimuth_deg" in fields
-            
-            # Validate time format
-            assert isinstance(influx_event["time"], str)
-            datetime.fromisoformat(influx_event["time"].replace('Z', '+00:00'))
+            # Validate satellite lighting structure
+            assert "condition" in window.satellite_lighting
+            assert "in_eclipse" in window.satellite_lighting
+            assert "in_sunlight" in window.satellite_lighting
 
 
 class TestPerformance:
