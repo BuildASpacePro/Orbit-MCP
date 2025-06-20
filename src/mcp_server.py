@@ -181,6 +181,49 @@ class SatelliteMCPServer:
                                 },
                                 "required": ["city_name", "inclination", "altitude_km", "start_time", "end_time"]
                             }
+                        },
+                        {
+                            "name": "calculate_satellite_to_satellite_access_windows",
+                            "description": "Calculate access windows between satellites with Earth occlusion checking",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "satellites": {
+                                        "type": "array",
+                                        "description": "Array of satellite TLE data",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "name": {"type": "string", "description": "Satellite name"},
+                                                "tle_line1": {"type": "string", "description": "TLE Line 1"},
+                                                "tle_line2": {"type": "string", "description": "TLE Line 2"}
+                                            },
+                                            "required": ["name", "tle_line1", "tle_line2"]
+                                        },
+                                        "minItems": 2
+                                    },
+                                    "start_time": {"type": "string", "description": "Start time ISO 8601"},
+                                    "end_time": {"type": "string", "description": "End time ISO 8601"},
+                                    "min_separation_deg": {"type": "number", "default": 0.0, "description": "Minimum angular separation in degrees"},
+                                    "time_step_seconds": {"type": "integer", "default": 30, "description": "Time step for calculations in seconds"}
+                                },
+                                "required": ["satellites", "start_time", "end_time"]
+                            }
+                        },
+                        {
+                            "name": "calculate_bulk_satellite_to_satellite_access_windows",
+                            "description": "Calculate access windows between satellites from CSV data",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "satellites_csv": {"type": "string", "description": "CSV content with satellite TLE data (columns: name, tle_line1, tle_line2)"},
+                                    "start_time": {"type": "string", "description": "Start time ISO 8601"},
+                                    "end_time": {"type": "string", "description": "End time ISO 8601"},
+                                    "min_separation_deg": {"type": "number", "default": 0.0, "description": "Minimum angular separation in degrees"},
+                                    "time_step_seconds": {"type": "integer", "default": 30, "description": "Time step for calculations in seconds"}
+                                },
+                                "required": ["satellites_csv", "start_time", "end_time"]
+                            }
                         }
                     ]
                 }
@@ -202,6 +245,10 @@ class SatelliteMCPServer:
                     result = await self._calculate_access_windows_from_orbital_elements(arguments)
                 elif tool_name == "calculate_access_windows_from_orbital_elements_by_city":
                     result = await self._calculate_access_windows_from_orbital_elements_by_city(arguments)
+                elif tool_name == "calculate_satellite_to_satellite_access_windows":
+                    result = await self._calculate_satellite_to_satellite_access_windows(arguments)
+                elif tool_name == "calculate_bulk_satellite_to_satellite_access_windows":
+                    result = await self._calculate_bulk_satellite_to_satellite_access_windows(arguments)
                 else:
                     return {
                         "jsonrpc": "2.0",
@@ -430,6 +477,81 @@ class SatelliteMCPServer:
                 {
                     "type": "text",
                     "text": json.dumps(city_results, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
+    
+    async def _calculate_satellite_to_satellite_access_windows(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate access windows between satellites."""
+        satellites = arguments["satellites"]
+        start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+        min_separation_deg = arguments.get("min_separation_deg", 0.0)
+        time_step_seconds = arguments.get("time_step_seconds", 30)
+        
+        # Convert to format expected by calculator
+        satellite_tles = []
+        for sat in satellites:
+            satellite_tles.append({
+                'name': sat['name'],
+                'tle_line1': sat['tle_line1'],
+                'tle_line2': sat['tle_line2']
+            })
+        
+        results = self.calculator.calculate_satellite_to_satellite_access_windows(
+            satellite_tles=satellite_tles,
+            start_time=start_time,
+            end_time=end_time,
+            min_separation_deg=min_separation_deg,
+            time_step_seconds=time_step_seconds
+        )
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(results, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
+    
+    async def _calculate_bulk_satellite_to_satellite_access_windows(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate bulk access windows between satellites from CSV."""
+        satellites_csv = arguments["satellites_csv"]
+        start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+        min_separation_deg = arguments.get("min_separation_deg", 0.0)
+        time_step_seconds = arguments.get("time_step_seconds", 30)
+        
+        # Parse satellites from CSV
+        satellite_tles = self.calculator.parse_satellites_from_csv_content(satellites_csv)
+        
+        if len(satellite_tles) < 2:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "error": "Need at least 2 satellites in CSV for inter-satellite calculations",
+                            "satellites_found": len(satellite_tles)
+                        }, indent=2)
+                    }
+                ]
+            }
+        
+        results = self.calculator.calculate_satellite_to_satellite_access_windows(
+            satellite_tles=satellite_tles,
+            start_time=start_time,
+            end_time=end_time,
+            min_separation_deg=min_separation_deg,
+            time_step_seconds=time_step_seconds
+        )
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(results, indent=2, cls=NumpyJSONEncoder)
                 }
             ]
         }

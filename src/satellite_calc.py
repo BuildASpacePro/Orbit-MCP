@@ -1179,3 +1179,240 @@ class SatelliteCalculator:
             "description": "Available orbit types for TLE generation from orbital elements"
         }
     
+    def _earth_occlusion_check(self, pos1_km: np.ndarray, pos2_km: np.ndarray) -> bool:
+        """Check if Earth blocks line of sight between two 3D positions.
+        
+        Args:
+            pos1_km: First satellite position [x, y, z] in km
+            pos2_km: Second satellite position [x, y, z] in km
+            
+        Returns:
+            True if Earth blocks line of sight, False if clear
+        """
+        earth_radius_km = 6371.0  # Mean Earth radius
+        
+        # Vector from pos1 to pos2
+        direction = pos2_km - pos1_km
+        distance = np.linalg.norm(direction)
+        
+        if distance < 1e-6:  # Same position
+            return False
+        
+        direction_unit = direction / distance
+        
+        # Find closest point on line to Earth center (origin)
+        # t is parameter along line: point = pos1 + t * direction_unit
+        t_closest = -np.dot(pos1_km, direction_unit)
+        
+        # Clamp t to line segment
+        t_closest = max(0, min(distance, t_closest))
+        
+        # Closest point on line segment to Earth center
+        closest_point = pos1_km + t_closest * direction_unit
+        closest_distance = np.linalg.norm(closest_point)
+        
+        # If closest point is inside Earth, line is occluded
+        return closest_distance < earth_radius_km
+    
+    def calculate_satellite_to_satellite_access_windows(
+        self,
+        satellite_tles: List[Dict[str, str]],
+        start_time: datetime,
+        end_time: datetime,
+        min_separation_deg: float = 0.0,
+        time_step_seconds: int = 30
+    ) -> Dict[str, Any]:
+        """Calculate access windows between satellites.
+        
+        Args:
+            satellite_tles: List of dicts with 'name', 'tle_line1', 'tle_line2'
+            start_time: Start time for calculations
+            end_time: End time for calculations
+            min_separation_deg: Minimum angular separation (0 = just line of sight)
+            time_step_seconds: Time step for calculations
+            
+        Returns:
+            Dict with satellite pair access windows
+        """
+        ts = load.timescale()
+        start_ts = ts.from_datetime(start_time.replace(tzinfo=timezone.utc))
+        end_ts = ts.from_datetime(end_time.replace(tzinfo=timezone.utc))
+        
+        # Create satellite objects
+        satellites = []
+        for sat_data in satellite_tles:
+            try:
+                satellite = EarthSatellite(
+                    sat_data['tle_line1'], 
+                    sat_data['tle_line2'],
+                    name=sat_data.get('name', 'Unknown'),
+                    ts=ts
+                )
+                satellites.append({'sat': satellite, 'name': sat_data.get('name', 'Unknown')})
+            except Exception as e:
+                logger.error(f"Failed to create satellite from TLE: {e}")
+                continue
+        
+        if len(satellites) < 2:
+            return {
+                "error": "Need at least 2 valid satellites for inter-satellite calculations",
+                "valid_satellites": len(satellites)
+            }
+        
+        # Calculate all pairwise access windows
+        all_results = []
+        
+        for i in range(len(satellites)):
+            for j in range(i + 1, len(satellites)):
+                sat1 = satellites[i]
+                sat2 = satellites[j]
+                
+                logger.info(f"Calculating access windows between {sat1['name']} and {sat2['name']}")
+                
+                # Generate time array
+                duration_seconds = (end_time - start_time).total_seconds()
+                num_steps = int(duration_seconds / time_step_seconds) + 1
+                times = start_ts + np.linspace(0, duration_seconds / 86400, num_steps)
+                
+                # Calculate positions for both satellites
+                pos1 = sat1['sat'].at(times)
+                pos2 = sat2['sat'].at(times)
+                
+                # Get positions in km relative to Earth center
+                pos1_km = pos1.position.km
+                pos2_km = pos2.position.km
+                
+                # Calculate separations and check occlusion
+                access_periods = []
+                in_access = False
+                access_start = None
+                
+                for idx, time in enumerate(times):
+                    # Check Earth occlusion
+                    occluded = self._earth_occlusion_check(pos1_km[:, idx], pos2_km[:, idx])
+                    
+                    # Calculate angular separation
+                    # Vector from sat1 to sat2
+                    sep_vector = pos2_km[:, idx] - pos1_km[:, idx]
+                    sep_distance = np.linalg.norm(sep_vector)
+                    
+                    # Angular separation as seen from sat1
+                    sat1_distance = np.linalg.norm(pos1_km[:, idx])
+                    if sat1_distance > 0 and sep_distance > 0:
+                        # Angle between sat1 position vector and separation vector
+                        cos_angle = np.dot(pos1_km[:, idx], sep_vector) / (sat1_distance * sep_distance)
+                        cos_angle = np.clip(cos_angle, -1, 1)
+                        separation_deg = np.degrees(np.arccos(np.abs(cos_angle)))
+                    else:
+                        separation_deg = 0
+                    
+                    # Check if in access (not occluded and meets separation requirement)
+                    has_access = not occluded and separation_deg >= min_separation_deg
+                    
+                    if has_access and not in_access:
+                        # Access start
+                        access_start = time
+                        in_access = True
+                    elif not has_access and in_access:
+                        # Access end
+                        if access_start is not None:
+                            access_periods.append({
+                                'start_time': access_start,
+                                'end_time': times[idx - 1] if idx > 0 else time,
+                                'start_idx': len(access_periods),
+                                'end_idx': idx - 1
+                            })
+                        in_access = False
+                        access_start = None
+                
+                # Handle case where access period extends to end
+                if in_access and access_start is not None:
+                    access_periods.append({
+                        'start_time': access_start,
+                        'end_time': times[-1],
+                        'start_idx': len(access_periods),
+                        'end_idx': len(times) - 1
+                    })
+                
+                # Format access windows
+                access_windows = []
+                for period in access_periods:
+                    start_idx = max(0, period['start_idx'])
+                    end_idx = min(len(times) - 1, period['end_idx'])
+                    
+                    if start_idx < len(times) and end_idx < len(times):
+                        # Calculate statistics for this window
+                        window_indices = range(start_idx, end_idx + 1)
+                        separations = []
+                        
+                        for idx in window_indices:
+                            sep_vector = pos2_km[:, idx] - pos1_km[:, idx]
+                            sep_distance = np.linalg.norm(sep_vector)
+                            sat1_distance = np.linalg.norm(pos1_km[:, idx])
+                            
+                            if sat1_distance > 0 and sep_distance > 0:
+                                cos_angle = np.dot(pos1_km[:, idx], sep_vector) / (sat1_distance * sep_distance)
+                                cos_angle = np.clip(cos_angle, -1, 1)
+                                separation_deg = np.degrees(np.arccos(np.abs(cos_angle)))
+                                separations.append(separation_deg)
+                        
+                        if separations:
+                            min_sep = min(separations)
+                            max_sep = max(separations)
+                        else:
+                            min_sep = max_sep = 0
+                        
+                        # Calculate relative velocity at midpoint
+                        mid_idx = (start_idx + end_idx) // 2
+                        if mid_idx < len(times) - 1:
+                            dt = (times[mid_idx + 1].tt - times[mid_idx].tt) * 86400  # seconds
+                            if dt > 0:
+                                vel1 = (pos1_km[:, mid_idx + 1] - pos1_km[:, mid_idx]) / dt
+                                vel2 = (pos2_km[:, mid_idx + 1] - pos2_km[:, mid_idx]) / dt
+                                rel_velocity = np.linalg.norm(vel2 - vel1)
+                            else:
+                                rel_velocity = 0
+                        else:
+                            rel_velocity = 0
+                        
+                        duration_seconds = (period['end_time'].tt - period['start_time'].tt) * 86400
+                        
+                        access_windows.append({
+                            "aos_time": period['start_time'].utc_iso(),
+                            "los_time": period['end_time'].utc_iso(),
+                            "duration_seconds": duration_seconds,
+                            "duration_minutes": duration_seconds / 60,
+                            "min_separation_deg": round(min_sep, 2),
+                            "max_separation_deg": round(max_sep, 2),
+                            "relative_velocity_km_s": round(rel_velocity, 2)
+                        })
+                
+                pair_result = {
+                    "satellite_pair": {
+                        "satellite_1": sat1['name'],
+                        "satellite_2": sat2['name']
+                    },
+                    "summary": {
+                        "total_windows": len(access_windows),
+                        "total_duration_minutes": sum(w["duration_minutes"] for w in access_windows),
+                        "calculation_parameters": {
+                            "min_separation_deg": min_separation_deg,
+                            "time_step_seconds": time_step_seconds
+                        }
+                    },
+                    "access_windows": access_windows
+                }
+                
+                all_results.append(pair_result)
+                logger.info(f"Found {len(access_windows)} access windows between {sat1['name']} and {sat2['name']}")
+        
+        return {
+            "calculation_info": {
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+                "total_satellites": len(satellites),
+                "total_pairs": len(all_results)
+            },
+            "satellite_pairs": all_results
+        }
+    
