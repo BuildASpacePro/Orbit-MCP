@@ -47,10 +47,10 @@ ENV MCP_SERVER_LOG_LEVEL=INFO
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import src.satellite_calc; calc = src.satellite_calc.SatelliteCalculator(); print('OK')" || exit 1
+    CMD python -c "from src.satellite_calc import SatelliteCalculator; calc = SatelliteCalculator(); print('OK')" || exit 1
 
 # Entry point  
-ENTRYPOINT ["python", "-m", "src.mcp_server_standalone"]
+ENTRYPOINT ["python", "-m", "src.mcp_server"]
 
 # Default command
 CMD []

@@ -1,715 +1,473 @@
-"""MCP Server for satellite orbital mechanics calculations."""
+"""Simple JSON-RPC 2.0 MCP server for satellite orbital mechanics calculations."""
 
 import asyncio
 import json
 import logging
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
+from dataclasses import asdict
+import numpy as np
 
-from mcp.server.models import InitializationOptions
-from mcp.server import NotificationOptions, Server
-from mcp.server.models import (
-    Tool,
-    ListToolsResult,
-    CallToolResult,
-    TextContent,
-    EmptyResult,
-    InitializationOptions,
-)
-from mcp.types import (
-    CallToolRequest,
-    ListToolsRequest,
-)
-from mcp.server.stdio import stdio_server
-
-from .satellite_calc import SatelliteCalculator, AccessWindow, TLEValidationResult
+from .satellite_calc import SatelliteCalculator
 
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stderr)
-    ]
+    handlers=[logging.StreamHandler(sys.stderr)]
 )
 logger = logging.getLogger(__name__)
 
 
+class NumpyJSONEncoder(json.JSONEncoder):
+    """Custom JSON encoder to handle numpy types."""
+    
+    def default(self, obj):
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
+
 class SatelliteMCPServer:
-    """MCP Server for satellite orbital mechanics calculations."""
+    """MCP-compatible server for satellite calculations."""
     
     def __init__(self):
-        """Initialize the MCP server."""
-        self.server = Server("satellite-mcp-server")
+        """Initialize the server."""
         self.calculator = SatelliteCalculator()
-        self._setup_handlers()
+        self.server_info = {
+            "name": "satellite-mcp-server",
+            "version": "1.0.0",
+            "description": "Satellite orbital mechanics calculations with natural language processing"
+        }
     
-    def _setup_handlers(self):
-        """Set up MCP server handlers."""
-        
-        @self.server.list_tools()
-        async def handle_list_tools() -> ListToolsResult:
-            """List available tools."""
-            tools = [
-                Tool(
-                    name="calculate_access_windows",
-                    description="Calculate satellite access windows over a ground station location",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "latitude": {
-                                "type": "number",
-                                "minimum": -90,
-                                "maximum": 90,
-                                "description": "Ground station latitude in decimal degrees (WGS84)"
-                            },
-                            "longitude": {
-                                "type": "number", 
-                                "minimum": -180,
-                                "maximum": 180,
-                                "description": "Ground station longitude in decimal degrees (WGS84)"
-                            },
-                            "tle_line1": {
-                                "type": "string",
-                                "pattern": "^1 ",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 1 in standard NORAD format"
-                            },
-                            "tle_line2": {
-                                "type": "string",
-                                "pattern": "^2 ",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 2 in standard NORAD format"
-                            },
-                            "start_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "Start time in ISO 8601 format (UTC)"
-                            },
-                            "end_time": {
-                                "type": "string",
-                                "format": "date-time", 
-                                "description": "End time in ISO 8601 format (UTC)"
-                            },
-                            "elevation_threshold": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 90,
-                                "default": 10.0,
-                                "description": "Minimum elevation angle in degrees"
-                            },
-                            "time_step_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 300,
-                                "default": 30,
-                                "description": "Time step for calculations in seconds"
-                            }
-                        },
-                        "required": ["latitude", "longitude", "tle_line1", "tle_line2", "start_time", "end_time"]
-                    }
-                ),
-                Tool(
-                    name="validate_tle",
-                    description="Validate Two-Line Element data and extract orbital parameters",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "tle_line1": {
-                                "type": "string",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 1 in standard NORAD format"
-                            },
-                            "tle_line2": {
-                                "type": "string",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 2 in standard NORAD format"
-                            }
-                        },
-                        "required": ["tle_line1", "tle_line2"]
-                    }
-                ),
-                Tool(
-                    name="calculate_bulk_access_windows",
-                    description="Calculate access windows for multiple satellites and ground locations from CSV data",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "locations_csv": {
-                                "type": "string",
-                                "description": "CSV content with ground locations (columns: name, latitude, longitude, altitude). Supports flexible column naming."
-                            },
-                            "satellites_csv": {
-                                "type": "string", 
-                                "description": "CSV content with satellite TLE data (columns: name, tle_line1, tle_line2). Supports flexible column naming."
-                            },
-                            "start_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "Start time in ISO 8601 format (UTC)"
-                            },
-                            "end_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "End time in ISO 8601 format (UTC)"
-                            },
-                            "elevation_threshold": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 90,
-                                "default": 10.0,
-                                "description": "Minimum elevation angle in degrees"
-                            },
-                            "time_step_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 300,
-                                "default": 30,
-                                "description": "Time step for calculations in seconds"
-                            }
-                        },
-                        "required": ["locations_csv", "satellites_csv", "start_time", "end_time"]
-                    }
-                ),
-                Tool(
-                    name="calculate_access_windows_by_city",
-                    description="Calculate satellite access windows for a city by name lookup from comprehensive world cities database",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "city_name": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Name of the city (e.g., 'London', 'New York', 'Tokyo'). Supports capitals and major cities worldwide."
-                            },
-                            "tle_line1": {
-                                "type": "string",
-                                "pattern": "^1 ",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 1 in standard NORAD format"
-                            },
-                            "tle_line2": {
-                                "type": "string",
-                                "pattern": "^2 ",
-                                "minLength": 69,
-                                "maxLength": 69,
-                                "description": "TLE Line 2 in standard NORAD format"
-                            },
-                            "start_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "Start time in ISO 8601 format (UTC)"
-                            },
-                            "end_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "End time in ISO 8601 format (UTC)"
-                            },
-                            "elevation_threshold": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 90,
-                                "default": 10.0,
-                                "description": "Minimum elevation angle in degrees"
-                            },
-                            "time_step_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 300,
-                                "default": 30,
-                                "description": "Time step for calculations in seconds"
-                            }
-                        },
-                        "required": ["city_name", "tle_line1", "tle_line2", "start_time", "end_time"]
-                    }
-                ),
-                Tool(
-                    name="search_cities",
-                    description="Search for cities in the world cities database by name or country",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Search query for city name or country"
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 50,
-                                "default": 10,
-                                "description": "Maximum number of results to return"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                ),
-                Tool(
-                    name="parse_orbital_elements",
-                    description="Parse natural language text to extract orbital parameters and generate TLE",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "orbital_text": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Natural language description of orbital parameters (e.g., 'satellite at 700km in SSO over London')"
-                            }
-                        },
-                        "required": ["orbital_text"]
-                    }
-                ),
-                Tool(
-                    name="calculate_access_windows_from_orbital_elements",
-                    description="Calculate satellite access windows using orbital elements from natural language text",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "orbital_text": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Natural language description of orbital parameters (e.g., 'LEO satellite at 400km with 51.6 degree inclination')"
-                            },
-                            "latitude": {
-                                "type": "number",
-                                "minimum": -90,
-                                "maximum": 90,
-                                "description": "Ground station latitude in decimal degrees (WGS84)"
-                            },
-                            "longitude": {
-                                "type": "number",
-                                "minimum": -180,
-                                "maximum": 180,
-                                "description": "Ground station longitude in decimal degrees (WGS84)"
-                            },
-                            "start_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "Start time in ISO 8601 format (UTC)"
-                            },
-                            "end_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "End time in ISO 8601 format (UTC)"
-                            },
-                            "elevation_threshold": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 90,
-                                "default": 10.0,
-                                "description": "Minimum elevation angle in degrees"
-                            },
-                            "time_step_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 300,
-                                "default": 30,
-                                "description": "Time step for calculations in seconds"
-                            }
-                        },
-                        "required": ["orbital_text", "latitude", "longitude", "start_time", "end_time"]
-                    }
-                ),
-                Tool(
-                    name="calculate_access_windows_from_orbital_elements_by_city",
-                    description="Calculate satellite access windows using orbital elements and city lookup",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "orbital_text": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Natural language description of orbital parameters (e.g., 'SSO at 700km', 'geostationary satellite')"
-                            },
-                            "city_name": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Name of the city (e.g., 'London', 'New York', 'Tokyo')"
-                            },
-                            "start_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "Start time in ISO 8601 format (UTC)"
-                            },
-                            "end_time": {
-                                "type": "string",
-                                "format": "date-time",
-                                "description": "End time in ISO 8601 format (UTC)"
-                            },
-                            "elevation_threshold": {
-                                "type": "number",
-                                "minimum": 0,
-                                "maximum": 90,
-                                "default": 10.0,
-                                "description": "Minimum elevation angle in degrees"
-                            },
-                            "time_step_seconds": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 300,
-                                "default": 30,
-                                "description": "Time step for calculations in seconds"
-                            }
-                        },
-                        "required": ["orbital_text", "city_name", "start_time", "end_time"]
-                    }
-                ),
-                Tool(
-                    name="get_orbit_types",
-                    description="Get available orbit types and their definitions for TLE generation",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": false
-                    }
-                )
-            ]
+    async def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle JSON-RPC 2.0 request."""
+        try:
+            method = request.get("method")
+            request_id = request.get("id")
+            params = request.get("params", {})
             
-            return ListToolsResult(tools=tools)
-        
-        @self.server.call_tool()
-        async def handle_call_tool(request: CallToolRequest) -> CallToolResult:
-            """Handle tool calls."""
-            try:
-                if request.params.name == "calculate_access_windows":
-                    return await self._handle_calculate_access_windows(request.params.arguments)
-                elif request.params.name == "validate_tle":
-                    return await self._handle_validate_tle(request.params.arguments)
-                elif request.params.name == "calculate_bulk_access_windows":
-                    return await self._handle_calculate_bulk_access_windows(request.params.arguments)
-                elif request.params.name == "calculate_access_windows_by_city":
-                    return await self._handle_calculate_access_windows_by_city(request.params.arguments)
-                elif request.params.name == "search_cities":
-                    return await self._handle_search_cities(request.params.arguments)
-                elif request.params.name == "parse_orbital_elements":
-                    return await self._handle_parse_orbital_elements(request.params.arguments)
-                elif request.params.name == "calculate_access_windows_from_orbital_elements":
-                    return await self._handle_calculate_access_windows_from_orbital_elements(request.params.arguments)
-                elif request.params.name == "calculate_access_windows_from_orbital_elements_by_city":
-                    return await self._handle_calculate_access_windows_from_orbital_elements_by_city(request.params.arguments)
-                elif request.params.name == "get_orbit_types":
-                    return await self._handle_get_orbit_types(request.params.arguments)
+            # Route to appropriate handler
+            if method == "initialize":
+                result = {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {}
+                    },
+                    "serverInfo": self.server_info
+                }
+            elif method == "tools/list":
+                result = {
+                    "tools": [
+                        {
+                            "name": "calculate_access_windows",
+                            "description": "Calculate satellite access windows with lighting information",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "latitude": {"type": "number", "description": "Ground station latitude"},
+                                    "longitude": {"type": "number", "description": "Ground station longitude"},
+                                    "altitude": {"type": "number", "description": "Ground station altitude in meters", "default": 0},
+                                    "tle_line1": {"type": "string", "description": "TLE Line 1"},
+                                    "tle_line2": {"type": "string", "description": "TLE Line 2"},
+                                    "start_time": {"type": "string", "description": "Start time ISO 8601"},
+                                    "end_time": {"type": "string", "description": "End time ISO 8601"},
+                                    "elevation_threshold": {"type": "number", "default": 10.0, "description": "Minimum elevation angle in degrees"}
+                                },
+                                "required": ["latitude", "longitude", "tle_line1", "tle_line2", "start_time", "end_time"]
+                            }
+                        },
+                        {
+                            "name": "calculate_bulk_access_windows",
+                            "description": "Calculate access windows from CSV data",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "locations_csv": {"type": "string", "description": "CSV content with locations"},
+                                    "satellites_csv": {"type": "string", "description": "CSV content with satellites"},
+                                    "start_time": {"type": "string", "description": "Start time ISO 8601"},
+                                    "end_time": {"type": "string", "description": "End time ISO 8601"},
+                                    "elevation_threshold": {"type": "number", "default": 10.0, "description": "Minimum elevation angle in degrees"}
+                                },
+                                "required": ["locations_csv", "satellites_csv", "start_time", "end_time"]
+                            }
+                        },
+                        {
+                            "name": "calculate_access_windows_by_city",
+                            "description": "Calculate satellite access windows for a city by name lookup",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "city_name": {"type": "string", "description": "Name of the city"},
+                                    "tle_line1": {"type": "string", "description": "TLE Line 1"},
+                                    "tle_line2": {"type": "string", "description": "TLE Line 2"},
+                                    "start_time": {"type": "string", "description": "Start time ISO 8601"},
+                                    "end_time": {"type": "string", "description": "End time ISO 8601"},
+                                    "elevation_threshold": {"type": "number", "default": 10.0, "description": "Minimum elevation angle in degrees"}
+                                },
+                                "required": ["city_name", "tle_line1", "tle_line2", "start_time", "end_time"]
+                            }
+                        },
+                        {
+                            "name": "search_cities",
+                            "description": "Search cities database functionality",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string", "description": "City search query"},
+                                    "limit": {"type": "integer", "default": 10, "description": "Maximum number of results"}
+                                },
+                                "required": ["query"]
+                            }
+                        },
+                        {
+                            "name": "validate_tle",
+                            "description": "TLE data validation",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "tle_line1": {"type": "string", "description": "TLE Line 1"},
+                                    "tle_line2": {"type": "string", "description": "TLE Line 2"}
+                                },
+                                "required": ["tle_line1", "tle_line2"]
+                            }
+                        },
+                        {
+                            "name": "calculate_access_windows_from_orbital_elements",
+                            "description": "Calculate access windows from orbital parameters (inclination, altitude) with near-circular eccentricity",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "latitude": {"type": "number", "description": "Ground station latitude"},
+                                    "longitude": {"type": "number", "description": "Ground station longitude"},
+                                    "altitude_ground": {"type": "number", "description": "Ground station altitude in meters", "default": 0},
+                                    "inclination": {"type": "number", "description": "Orbital inclination in degrees"},
+                                    "altitude_km": {"type": "number", "description": "Satellite altitude in kilometers"},
+                                    "start_time": {"type": "string", "description": "Start time ISO 8601"},
+                                    "end_time": {"type": "string", "description": "End time ISO 8601"},
+                                    "elevation_threshold": {"type": "number", "default": 10.0, "description": "Minimum elevation angle in degrees"},
+                                    "eccentricity": {"type": "number", "default": 0.0001, "description": "Orbital eccentricity (defaults to near-circular)"},
+                                    "raan": {"type": "number", "default": 0.0, "description": "Right Ascension of Ascending Node in degrees"},
+                                    "arg_perigee": {"type": "number", "default": 0.0, "description": "Argument of perigee in degrees"},
+                                    "mean_anomaly": {"type": "number", "default": 0.0, "description": "Mean anomaly in degrees"}
+                                },
+                                "required": ["latitude", "longitude", "inclination", "altitude_km", "start_time", "end_time"]
+                            }
+                        },
+                        {
+                            "name": "calculate_access_windows_from_orbital_elements_by_city",
+                            "description": "Calculate access windows from orbital parameters for a city by name",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "city_name": {"type": "string", "description": "Name of the city"},
+                                    "inclination": {"type": "number", "description": "Orbital inclination in degrees"},
+                                    "altitude_km": {"type": "number", "description": "Satellite altitude in kilometers"},
+                                    "start_time": {"type": "string", "description": "Start time ISO 8601"},
+                                    "end_time": {"type": "string", "description": "End time ISO 8601"},
+                                    "elevation_threshold": {"type": "number", "default": 10.0, "description": "Minimum elevation angle in degrees"},
+                                    "eccentricity": {"type": "number", "default": 0.0001, "description": "Orbital eccentricity (defaults to near-circular)"},
+                                    "raan": {"type": "number", "default": 0.0, "description": "Right Ascension of Ascending Node in degrees"},
+                                    "arg_perigee": {"type": "number", "default": 0.0, "description": "Argument of perigee in degrees"},
+                                    "mean_anomaly": {"type": "number", "default": 0.0, "description": "Mean anomaly in degrees"}
+                                },
+                                "required": ["city_name", "inclination", "altitude_km", "start_time", "end_time"]
+                            }
+                        }
+                    ]
+                }
+            elif method == "tools/call":
+                tool_name = params.get("name")
+                arguments = params.get("arguments", {})
+                
+                if tool_name == "calculate_access_windows":
+                    result = await self._calculate_access_windows(arguments)
+                elif tool_name == "calculate_bulk_access_windows":
+                    result = await self._calculate_bulk_access_windows(arguments)
+                elif tool_name == "calculate_access_windows_by_city":
+                    result = await self._calculate_access_windows_by_city(arguments)
+                elif tool_name == "search_cities":
+                    result = await self._search_cities(arguments)
+                elif tool_name == "validate_tle":
+                    result = await self._validate_tle(arguments)
+                elif tool_name == "calculate_access_windows_from_orbital_elements":
+                    result = await self._calculate_access_windows_from_orbital_elements(arguments)
+                elif tool_name == "calculate_access_windows_from_orbital_elements_by_city":
+                    result = await self._calculate_access_windows_from_orbital_elements_by_city(arguments)
                 else:
-                    raise ValueError(f"Unknown tool: {request.params.name}")
-                    
-            except Exception as e:
-                logger.error(f"Error handling tool call {request.params.name}: {str(e)}")
-                return CallToolResult(
-                    content=[TextContent(type="text", text=f"Error: {str(e)}")],
-                    isError=True
-                )
-    
-    async def _handle_calculate_access_windows(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle calculate_access_windows tool call."""
-        try:
-            # Extract and validate arguments
-            latitude = float(arguments["latitude"])
-            longitude = float(arguments["longitude"])
-            tle_line1 = str(arguments["tle_line1"])
-            tle_line2 = str(arguments["tle_line2"])
-            start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
-            elevation_threshold = float(arguments.get("elevation_threshold", 10.0))
-            time_step_seconds = int(arguments.get("time_step_seconds", 30))
-            
-            # Calculate access windows
-            access_windows = self.calculator.calculate_access_windows(
-                latitude=latitude,
-                longitude=longitude,
-                tle_line1=tle_line1,
-                tle_line2=tle_line2,
-                start_time=start_time,
-                end_time=end_time,
-                elevation_threshold=elevation_threshold,
-                time_step_seconds=time_step_seconds
-            )
-            
-            # Format response
-            windows_data = []
-            total_duration = 0.0
-            max_elevation_overall = 0.0
-            
-            for window in access_windows:
-                window_dict = {
-                    "aos_time": window.aos_time.isoformat(),
-                    "los_time": window.los_time.isoformat(),
-                    "culmination_time": window.culmination_time.isoformat(),
-                    "duration_seconds": window.duration_seconds,
-                    "duration_minutes": round(window.duration_seconds / 60.0, 2),
-                    "max_elevation_deg": round(window.max_elevation_deg, 2),
-                    "aos_azimuth_deg": round(window.aos_azimuth_deg, 2),
-                    "los_azimuth_deg": round(window.los_azimuth_deg, 2),
-                    "culmination_azimuth_deg": round(window.culmination_azimuth_deg, 2),
-                    "ground_lighting": window.ground_lighting,
-                    "satellite_lighting": window.satellite_lighting
-                }
-                windows_data.append(window_dict)
-                total_duration += window.duration_seconds
-                max_elevation_overall = max(max_elevation_overall, window.max_elevation_deg)
-            
-            response = {
-                "summary": {
-                    "total_windows": len(access_windows),
-                    "total_duration_seconds": total_duration,
-                    "total_duration_minutes": round(total_duration / 60.0, 2),
-                    "max_elevation_deg": round(max_elevation_overall, 2),
-                    "calculation_parameters": {
-                        "latitude": latitude,
-                        "longitude": longitude,
-                        "start_time": start_time.isoformat(),
-                        "end_time": end_time.isoformat(),
-                        "elevation_threshold": elevation_threshold,
-                        "time_step_seconds": time_step_seconds
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
                     }
-                },
-                "access_windows": windows_data
-            }
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(response, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in calculate_access_windows: {str(e)}")
-            raise
-    
-    async def _handle_validate_tle(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle validate_tle tool call."""
-        try:
-            # Extract arguments
-            tle_line1 = str(arguments["tle_line1"])
-            tle_line2 = str(arguments["tle_line2"])
-            
-            # Validate TLE
-            validation_result = self.calculator.validate_tle(tle_line1, tle_line2)
-            
-            # Format response
-            response = {
-                "is_valid": validation_result.is_valid,
-                "errors": validation_result.errors,
-                "orbital_parameters": {}
-            }
-            
-            if validation_result.is_valid:
-                response["orbital_parameters"] = {
-                    "satellite_number": validation_result.satellite_number,
-                    "classification": validation_result.classification,
-                    "international_designator": validation_result.international_designator,
-                    "epoch": validation_result.epoch.isoformat() if validation_result.epoch else None,
-                    "mean_motion_rev_per_day": validation_result.mean_motion,
-                    "eccentricity": validation_result.eccentricity,
-                    "inclination_deg": validation_result.inclination_deg,
-                    "orbital_period_minutes": round(validation_result.orbital_period_minutes, 2) if validation_result.orbital_period_minutes else None
+            else:
+                return {
+                    "jsonrpc": "2.0", 
+                    "id": request_id,
+                    "error": {"code": -32601, "message": f"Unknown method: {method}"}
                 }
             
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(response, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in validate_tle: {str(e)}")
-            raise
-    
-    async def _handle_calculate_bulk_access_windows(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle calculate_bulk_access_windows tool call."""
-        try:
-            # Extract and validate arguments
-            locations_csv = str(arguments["locations_csv"])
-            satellites_csv = str(arguments["satellites_csv"])
-            start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
-            elevation_threshold = float(arguments.get("elevation_threshold", 10.0))
-            time_step_seconds = int(arguments.get("time_step_seconds", 30))
-            
-            # Calculate bulk access windows
-            bulk_results = self.calculator.calculate_bulk_access_windows(
-                locations_csv=locations_csv,
-                satellites_csv=satellites_csv,
-                start_time=start_time,
-                end_time=end_time,
-                elevation_threshold=elevation_threshold,
-                time_step_seconds=time_step_seconds
-            )
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(bulk_results, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in calculate_bulk_access_windows: {str(e)}")
-            raise
-    
-    async def _handle_calculate_access_windows_by_city(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle calculate_access_windows_by_city tool call."""
-        try:
-            # Extract and validate arguments
-            city_name = str(arguments["city_name"])
-            tle_line1 = str(arguments["tle_line1"])
-            tle_line2 = str(arguments["tle_line2"])
-            start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
-            elevation_threshold = float(arguments.get("elevation_threshold", 10.0))
-            time_step_seconds = int(arguments.get("time_step_seconds", 30))
-            
-            # Calculate access windows by city
-            city_results = self.calculator.calculate_access_windows_by_city(
-                city_name=city_name,
-                tle_line1=tle_line1,
-                tle_line2=tle_line2,
-                start_time=start_time,
-                end_time=end_time,
-                elevation_threshold=elevation_threshold,
-                time_step_seconds=time_step_seconds
-            )
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(city_results, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in calculate_access_windows_by_city: {str(e)}")
-            raise
-    
-    async def _handle_search_cities(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle search_cities tool call."""
-        try:
-            # Extract and validate arguments
-            query = str(arguments["query"])
-            limit = int(arguments.get("limit", 10))
-            
-            # Search cities
-            search_results = self.calculator.search_cities_by_name(query, limit)
-            
-            response = {
-                "query": query,
-                "total_results": len(search_results),
-                "cities": search_results
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result
             }
             
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(response, indent=2))]
-            )
-            
         except Exception as e:
-            logger.error(f"Error in search_cities: {str(e)}")
-            raise
+            logger.error(f"Error: {str(e)}")
+            return {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {"code": -32603, "message": "Internal error", "data": str(e)}
+            }
     
-    async def _handle_parse_orbital_elements(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle parse_orbital_elements tool call."""
-        try:
-            # Extract and validate arguments
-            orbital_text = str(arguments["orbital_text"])
-            
-            # Parse orbital elements
-            orbital_result = self.calculator.parse_orbital_elements_from_text(orbital_text)
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(orbital_result, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in parse_orbital_elements: {str(e)}")
-            raise
+    async def _calculate_access_windows_by_city(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate access windows by city."""
+        city_name = arguments["city_name"]
+        tle_line1 = arguments["tle_line1"]
+        tle_line2 = arguments["tle_line2"]
+        start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+        elevation_threshold = arguments.get("elevation_threshold", 10.0)
+        
+        city_results = self.calculator.calculate_access_windows_by_city(
+            city_name=city_name,
+            tle_line1=tle_line1,
+            tle_line2=tle_line2,
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold
+        )
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(city_results, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
     
-    async def _handle_calculate_access_windows_from_orbital_elements(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle calculate_access_windows_from_orbital_elements tool call."""
-        try:
-            # Extract and validate arguments
-            orbital_text = str(arguments["orbital_text"])
-            latitude = float(arguments["latitude"])
-            longitude = float(arguments["longitude"])
-            start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
-            elevation_threshold = float(arguments.get("elevation_threshold", 10.0))
-            time_step_seconds = int(arguments.get("time_step_seconds", 30))
-            
-            # Calculate access windows from orbital elements
-            result = self.calculator.calculate_access_windows_from_orbital_elements(
-                orbital_text=orbital_text,
-                latitude=latitude,
-                longitude=longitude,
-                start_time=start_time,
-                end_time=end_time,
-                elevation_threshold=elevation_threshold,
-                time_step_seconds=time_step_seconds
-            )
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(result, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in calculate_access_windows_from_orbital_elements: {str(e)}")
-            raise
+    async def _calculate_access_windows(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate basic access windows."""
+        latitude = arguments["latitude"]
+        longitude = arguments["longitude"]
+        altitude = arguments.get("altitude", 0)
+        tle_line1 = arguments["tle_line1"]
+        tle_line2 = arguments["tle_line2"]
+        start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+        elevation_threshold = arguments.get("elevation_threshold", 10.0)
+        
+        access_windows = self.calculator.calculate_access_windows(
+            latitude=latitude,
+            longitude=longitude,
+            altitude=altitude,
+            tle_line1=tle_line1,
+            tle_line2=tle_line2,
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold
+        )
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(access_windows, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
     
-    async def _handle_calculate_access_windows_from_orbital_elements_by_city(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle calculate_access_windows_from_orbital_elements_by_city tool call."""
-        try:
-            # Extract and validate arguments
-            orbital_text = str(arguments["orbital_text"])
-            city_name = str(arguments["city_name"])
-            start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
-            end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
-            elevation_threshold = float(arguments.get("elevation_threshold", 10.0))
-            time_step_seconds = int(arguments.get("time_step_seconds", 30))
-            
-            # Calculate access windows from orbital elements by city
-            result = self.calculator.calculate_access_windows_from_orbital_elements_by_city(
-                orbital_text=orbital_text,
-                city_name=city_name,
-                start_time=start_time,
-                end_time=end_time,
-                elevation_threshold=elevation_threshold,
-                time_step_seconds=time_step_seconds
-            )
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(result, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in calculate_access_windows_from_orbital_elements_by_city: {str(e)}")
-            raise
+    async def _calculate_bulk_access_windows(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate bulk access windows from CSV data."""
+        locations_csv = arguments["locations_csv"]
+        satellites_csv = arguments["satellites_csv"]
+        start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+        elevation_threshold = arguments.get("elevation_threshold", 10.0)
+        
+        bulk_results = self.calculator.calculate_bulk_access_windows(
+            locations_csv=locations_csv,
+            satellites_csv=satellites_csv,
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold
+        )
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(bulk_results, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
     
-    async def _handle_get_orbit_types(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Handle get_orbit_types tool call."""
-        try:
-            # Get orbit types
-            orbit_types = self.calculator.get_orbit_types()
-            
-            return CallToolResult(
-                content=[TextContent(type="text", text=json.dumps(orbit_types, indent=2))]
-            )
-            
-        except Exception as e:
-            logger.error(f"Error in get_orbit_types: {str(e)}")
-            raise
+    async def _validate_tle(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate TLE data."""
+        tle_line1 = arguments["tle_line1"]
+        tle_line2 = arguments["tle_line2"]
+        
+        validation_result = self.calculator.validate_tle(tle_line1, tle_line2)
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(asdict(validation_result), indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
+    
+    async def _search_cities(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Search cities."""
+        query = arguments["query"]
+        limit = arguments.get("limit", 10)
+        
+        search_results = self.calculator.search_cities_by_name(query, limit)
+        response = {
+            "query": query,
+            "total_results": len(search_results),
+            "cities": search_results
+        }
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(response, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
+    
+    async def _calculate_access_windows_from_orbital_elements(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate access windows from orbital elements."""
+        latitude = arguments["latitude"]
+        longitude = arguments["longitude"]
+        altitude_ground = arguments.get("altitude_ground", 0)
+        inclination = arguments["inclination"]
+        altitude_km = arguments["altitude_km"]
+        start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+        elevation_threshold = arguments.get("elevation_threshold", 10.0)
+        eccentricity = arguments.get("eccentricity", 0.0001)
+        raan = arguments.get("raan", 0.0)
+        arg_perigee = arguments.get("arg_perigee", 0.0)
+        mean_anomaly = arguments.get("mean_anomaly", 0.0)
+        
+        # Construct orbital description text
+        orbital_text = f"Satellite at {altitude_km} km altitude with {inclination} degree inclination"
+        if eccentricity > 0.001:
+            orbital_text += f" and {eccentricity} eccentricity"
+        if raan != 0.0:
+            orbital_text += f", RAAN {raan} degrees"
+        if arg_perigee != 0.0:
+            orbital_text += f", argument of perigee {arg_perigee} degrees"
+        if mean_anomaly != 0.0:
+            orbital_text += f", mean anomaly {mean_anomaly} degrees"
+        
+        access_windows = self.calculator.calculate_access_windows_from_orbital_elements(
+            orbital_text=orbital_text,
+            latitude=latitude,
+            longitude=longitude,
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold
+        )
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(access_windows, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
+    
+    async def _calculate_access_windows_from_orbital_elements_by_city(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate access windows from orbital elements by city."""
+        city_name = arguments["city_name"]
+        inclination = arguments["inclination"]
+        altitude_km = arguments["altitude_km"]
+        start_time = datetime.fromisoformat(arguments["start_time"].replace('Z', '+00:00'))
+        end_time = datetime.fromisoformat(arguments["end_time"].replace('Z', '+00:00'))
+        elevation_threshold = arguments.get("elevation_threshold", 10.0)
+        eccentricity = arguments.get("eccentricity", 0.0001)
+        raan = arguments.get("raan", 0.0)
+        arg_perigee = arguments.get("arg_perigee", 0.0)
+        mean_anomaly = arguments.get("mean_anomaly", 0.0)
+        
+        # Construct orbital description text
+        orbital_text = f"Satellite at {altitude_km} km altitude with {inclination} degree inclination"
+        if eccentricity > 0.001:
+            orbital_text += f" and {eccentricity} eccentricity"
+        if raan != 0.0:
+            orbital_text += f", RAAN {raan} degrees"
+        if arg_perigee != 0.0:
+            orbital_text += f", argument of perigee {arg_perigee} degrees"
+        if mean_anomaly != 0.0:
+            orbital_text += f", mean anomaly {mean_anomaly} degrees"
+        
+        city_results = self.calculator.calculate_access_windows_from_orbital_elements_by_city(
+            orbital_text=orbital_text,
+            city_name=city_name,
+            start_time=start_time,
+            end_time=end_time,
+            elevation_threshold=elevation_threshold
+        )
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(city_results, indent=2, cls=NumpyJSONEncoder)
+                }
+            ]
+        }
     
     async def run(self):
-        """Run the MCP server."""
+        """Run the server."""
         logger.info("Starting Satellite MCP Server")
         
-        async with stdio_server() as (read_stream, write_stream):
-            await self.server.run(
-                read_stream,
-                write_stream,
-                InitializationOptions(
-                    server_name="satellite-mcp-server",
-                    server_version="1.0.0",
-                    capabilities=self.server.get_capabilities(
-                        notification_options=NotificationOptions(),
-                        experimental_capabilities={}
-                    )
+        try:
+            while True:
+                line = await asyncio.get_event_loop().run_in_executor(
+                    None, sys.stdin.readline
                 )
-            )
+                
+                if not line:
+                    break
+                
+                line = line.strip()
+                if not line:
+                    continue
+                
+                try:
+                    request = json.loads(line)
+                    response = await self.handle_request(request)
+                    print(json.dumps(response, cls=NumpyJSONEncoder), flush=True)
+                    
+                except json.JSONDecodeError as e:
+                    error_response = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32700, "message": "Parse error", "data": str(e)}
+                    }
+                    print(json.dumps(error_response, cls=NumpyJSONEncoder), flush=True)
+                
+        except KeyboardInterrupt:
+            logger.info("Server stopped")
+        except Exception as e:
+            logger.error(f"Server error: {str(e)}")
 
 
 async def main():
